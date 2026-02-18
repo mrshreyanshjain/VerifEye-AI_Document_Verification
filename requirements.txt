@@ -2,9 +2,11 @@ fastapi==0.104.1
 uvicorn==0.24.0
 python-multipart==0.0.6
 pillow==10.0.0
-opencv-python-headless==4.8.0.76
+# Use headless opencv to save memory and avoid libGL errors
+opencv-python-headless==4.8.0.76 
 easyocr==1.7.0
 ultralytics==8.0.194
 ollama==0.1.0
 aiofiles==23.2.1
+# Force NumPy 1.x to avoid compatibility issues
 numpy<2
