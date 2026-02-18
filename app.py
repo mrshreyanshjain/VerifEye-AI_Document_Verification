@@ -3,19 +3,27 @@ import json
 import re
 import cv2
 import asyncio
+import gc  # Garbage Collector
+import shutil
+from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from PIL import Image
-import easyocr
 from ultralytics import YOLO
-import shutil
-from pathlib import Path
-import gc
+import easyocr
+
+# ==========================================
+# 1. CONFIGURATION & SETUP
+# ==========================================
 
 # Base directory for absolute paths
 BASE_DIR = Path(__file__).resolve().parent
+UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
+MAX_FILE_SIZE = 16 * 1024 * 1024  # 16MB
+
+# Create uploads folder if it doesn't exist
+Path(UPLOAD_FOLDER).mkdir(exist_ok=True)
 
 app = FastAPI(title="VerifEye: AI Identity Verification System", version="2.0")
 
@@ -32,7 +40,7 @@ app.add_middleware(
 @app.middleware("http")
 async def add_cache_control(request, call_next):
     response = await call_next(request)
-    if request.url.path.endswith('.css') or request.url.path.endswith('.js'):
+    if request.url.path.endswith(('.css', '.js', '.png', '.jpg', '.ico')):
         response.headers["Cache-Control"] = "public, max-age=3600, must-revalidate"
     else:
         response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
@@ -40,17 +48,13 @@ async def add_cache_control(request, call_next):
         response.headers["Expires"] = "0"
     return response
 
-# File upload configuration
-UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
-MAX_FILE_SIZE = 16 * 1024 * 1024  # 16MB
-
-# Create uploads folder if it doesn't exist
-Path(UPLOAD_FOLDER).mkdir(exist_ok=True)
-
 # Mount static files
 app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
 
-# 1. MODEL PATHS & CONFIGURATION
+# ==========================================
+# 2. MODEL MANAGEMENT (LAZY LOADING)
+# ==========================================
+
 MODEL_PATHS = {
     "AADHAAR": "trained_models/aadhar_best/weights/best.pt",
     "PAN": "trained_models/pan_best/weights/best.pt",
@@ -59,23 +63,72 @@ MODEL_PATHS = {
 }
 MODEL_NAME = "llama3"
 
-# Load EasyOCR (Global instance - Keep this, it takes ~300MB but is needed)
-print("⏳ Loading EasyOCR...")
-reader = easyocr.Reader(['en'], gpu=False)
-
-# Check Ollama Availability
+# Check for Ollama (Optional)
 try:
     import ollama
     OLLAMA_AVAILABLE = True
 except ImportError:
     OLLAMA_AVAILABLE = False
-    print("❌ 'ollama' library missing.")
+    print("⚠️ 'ollama' library missing. AI extraction disabled.")
 
-# --- OPTIMIZATION: REMOVED GLOBAL YOLO LOADING ---
-# We do NOT load YOLO models here anymore to save RAM on Render Free Tier.
-# If you need YOLO for a specific task, load it inside the function and delete it after.
+def run_lazy_ocr(image_path):
+    """
+    Loads EasyOCR, extracts text, then immediately removes it from RAM.
+    This prevents OOM errors on Render Free Tier.
+    """
+    reader = None
+    try:
+        # Load Reader (CPU only)
+        reader = easyocr.Reader(['en'], gpu=False, verbose=False)
+        
+        # Read Image
+        img_cv = cv2.imread(image_path)
+        img_cv = cv2.fastNlMeansDenoisingColored(img_cv, None, 10, 10, 7, 21)
+        
+        # Extract
+        result = reader.readtext(img_cv, detail=0)
+        return " ".join(result)
+    except Exception as e:
+        print(f"❌ OCR Error: {e}")
+        return ""
+    finally:
+        # CRITICAL: Delete model and clear memory
+        if reader: 
+            del reader
+        gc.collect()
 
-# 2. EXTRACTION LOGIC
+def get_yolo_confidence(doc_type, image_path):
+    """
+    Loads specific YOLO model, checks confidence, then deletes it.
+    """
+    if doc_type not in MODEL_PATHS or not os.path.exists(MODEL_PATHS[doc_type]):
+        return None
+
+    model = None
+    try:
+        model = YOLO(MODEL_PATHS[doc_type])
+        results = model(image_path, verbose=False)
+        
+        conf = 0.0
+        if results:
+            if results[0].boxes:
+                conf = results[0].boxes.conf.max().item()
+            elif results[0].probs:
+                conf = results[0].probs.top1conf.item()
+        
+        return f"{conf * 100:.2f}%"
+    except Exception as e:
+        return None
+    finally:
+        # CRITICAL: Delete model and clear memory
+        if model:
+            del model
+        gc.collect()
+
+# ==========================================
+# 3. EXTRACTION LOGIC
+# ==========================================
+
 def detect_document_type(text):
     t = text.upper()
     if re.search(r'\b\d{4}\s\d{4}\s\d{4}\b', text): return "AADHAAR"
@@ -104,7 +157,6 @@ def extract_regex_data(text, doc_type):
         if m: res["ID Number"] = m.group()
     return res
 
-
 def analyze_with_ollama(text, doc_type, is_back):
     if not OLLAMA_AVAILABLE:
         return {}
@@ -129,7 +181,6 @@ def analyze_with_ollama(text, doc_type, is_back):
     4. "Validity" is the expiry date (Valid Till)."""
 
     try:
-        # Note: This will likely fail on Render Free Tier unless you point to an external Ollama URL
         resp = ollama.chat(model=MODEL_NAME, messages=[{'role': 'user', 'content': prompt}])
         content = resp['message']['content']
         # JSON extraction logic
@@ -138,10 +189,8 @@ def analyze_with_ollama(text, doc_type, is_back):
         if start != -1 and end != -1:
             return json.loads(content[start:end])
         return {}
-    except Exception as e:
-        print(f"[WARN] Ollama inference failed: {e}")
+    except:
         return {}
-
 
 def post_process(data, doc_type, is_back):
     clean = {}
@@ -176,22 +225,19 @@ def post_process(data, doc_type, is_back):
             else:
                 clean[k] = str(v).strip()
 
-    # --- CLEANING FOR DRIVING LICENSE ---
+    # --- SPECIFIC CLEANING LOGIC ---
     if doc_type == "DRIVING":
         if "DOB" in clean:
             dob_year_match = re.search(r'\d{4}', clean["DOB"])
             if dob_year_match:
                 year = int(dob_year_match.group())
-                current_year = 2025 
-                if year > current_year:
+                if year > 2025: # Future date likely Validity
                     if "Validity" not in clean:
                         clean["Validity"] = clean["DOB"]
                     del clean["DOB"]
-
         if "ID Number" in clean:
             clean["ID Number"] = re.sub(r'(?i)(DL\s*No|Licence\s*No)[:\.\s-]*', '', clean["ID Number"]).strip()
 
-    # --- CLEANING FOR AADHAAR ---
     if doc_type == "AADHAAR":
         if "ID Number" in clean:
             clean["ID Number"] = re.sub(r'[^\d\s]', '', clean["ID Number"])[:14]
@@ -203,7 +249,6 @@ def post_process(data, doc_type, is_back):
             addr = re.sub(r'^(Address|Addr|To|Date).*?[:,-]', '', addr, flags=re.IGNORECASE)
             clean["Address"] = addr.strip(" ,;:-")
 
-    # --- CLEANING FOR PAN ---
     if doc_type == "PAN":
         noise_words = ["INCOME", "TAX", "DEPARTMENT", "GOVT", "INDIA", "SIGNATURE", "CHAIRMAN"]
         for field in ["Name", "Parent Name"]:
@@ -218,125 +263,6 @@ def post_process(data, doc_type, is_back):
                     clean[field] = val
 
     return clean
-
-def process_document(image_path, target_doc_type=None):
-    try:
-        # 1. Read and denoise image
-        img_cv = cv2.imread(image_path)
-        img_cv = cv2.fastNlMeansDenoisingColored(img_cv, None, 10, 10, 7, 21)
-
-        # 2. Extract text with OCR
-        result = reader.readtext(img_cv, detail=0)
-        raw_text = " ".join(result)
-
-        # 3. Detect document type (Robust Check)
-        detected_type = detect_document_type(raw_text)
-        is_back = is_back_side(raw_text)
-
-        # --- CHECK MISMATCH IMMEDIATELY ---
-        if target_doc_type and detected_type != "Unknown_Document" and detected_type != target_doc_type:
-            print(f"[DEBUG] Mismatch Detected: Expected {target_doc_type}, Got {detected_type}")
-            return {
-                "success": False,
-                "error": f"Document mismatch detected!", 
-                "data": {},
-                "doc_type": detected_type,
-                "is_back": is_back
-            }
-
-        # 4. Extract data
-        regex_data = extract_regex_data(raw_text, detected_type)
-        ai_data = analyze_with_ollama(raw_text, detected_type, is_back)
-
-        final_data = ai_data.copy()
-        if regex_data.get("ID Number"):
-            final_data["ID Number"] = regex_data["ID Number"]
-        if regex_data.get("VID Number"):
-            final_data["VID Number"] = regex_data["VID Number"]
-        dob_match = re.search(r'\b\d{2}/\d{2}/\d{4}\b', raw_text)
-        if dob_match and (not final_data.get("DOB") or "1008" in final_data.get("DOB", "")):
-            final_data["DOB"] = dob_match.group()
-
-        # 5. Post-process
-        final_data = post_process(final_data, detected_type, is_back)
-
-        # 6. FORCE MEMORY CLEANUP
-        del img_cv
-        del result
-        gc.collect()
-
-        return {
-            "success": True,
-            "data": final_data,
-            "doc_type": detected_type,
-            "is_back": is_back,
-            "raw_text": raw_text
-        }
-    except Exception as e:
-        print(f"[ERROR] Processing failed: {e}")
-        return {
-            "success": False,
-            "error": str(e)
-        }
-
-# 3. ROUTES
-@app.get("/", response_class=FileResponse)
-async def root():
-    return FileResponse(os.path.join(BASE_DIR, 'templates', 'index.html'))
-
-@app.get("/favicon.ico", include_in_schema=False)
-async def favicon():
-    return FileResponse(os.path.join(BASE_DIR, 'static', 'favicon.ico')) if os.path.exists(os.path.join(BASE_DIR, 'static', 'favicon.ico')) else HTMLResponse(status_code=204)
-
-@app.post("/api/upload")
-async def upload(file: UploadFile = File(...), doc_type: str = Form(...)):
-    # Validate file
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="No file selected")
-
-    if file.content_type not in ["image/jpeg", "image/png", "image/jpg"]:
-        raise HTTPException(status_code=400, detail="Invalid file type. Use JPG or PNG only.")
-
-    if doc_type in ["null", "undefined", ""]:
-        doc_type = None
-
-    filepath = os.path.join(UPLOAD_FOLDER, file.filename)
-    try:
-        # Save uploaded file
-        with open(filepath, "wb") as f:
-            contents = await file.read()
-            if len(contents) > MAX_FILE_SIZE:
-                raise HTTPException(status_code=400, detail="File too large. Max 16MB.")
-            f.write(contents)
-
-        # Process document
-        result = await asyncio.to_thread(process_document, filepath, doc_type)
-        print("[DEBUG] Extraction result:", result)
-
-        # Handle extraction failure
-        if result.get("success") and (not result.get("data") or not any(result["data"].values())):
-            result = {
-                "success": False,
-                "error": "No details could be extracted from this image. Please try a clearer image.",
-                "doc_type": result.get("doc_type", doc_type),
-                "data": {},
-            }
-
-        # Auto-save data
-        if result.get("success"):
-            actual_doc_type = result.get("doc_type", doc_type)
-            if actual_doc_type and actual_doc_type != "Unknown_Document":
-                _save_document_data(result["data"], actual_doc_type)
-
-        return result
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        # ALWAYS Clean up uploaded file to save disk space
-        if os.path.exists(filepath):
-            os.remove(filepath)
-        gc.collect()
 
 def _save_document_data(data, doc_type):
     """Helper to save or update document data in JSON files"""
@@ -368,7 +294,7 @@ def _save_document_data(data, doc_type):
     else:
         for record in existing_records:
             if record == data:
-                updated = True
+                updated = True 
                 break
     
     if not updated:
@@ -379,8 +305,140 @@ def _save_document_data(data, doc_type):
     
     return updated
 
+def process_document(image_path, target_doc_type=None):
+    try:
+        # 1. OCR (LAZY LOADED)
+        # This function loads EasyOCR, runs it, and deletes it immediately
+        raw_text = run_lazy_ocr(image_path)
+        
+        if not raw_text.strip():
+            return {
+                "success": False,
+                "error": "Could not extract text. Image might be too blurry."
+            }
+
+        # 2. Detect document type
+        detected_type = detect_document_type(raw_text)
+        is_back = is_back_side(raw_text)
+
+        # 3. Check Mismatch
+        if target_doc_type and detected_type != "Unknown_Document" and detected_type != target_doc_type:
+            print(f"[DEBUG] Mismatch Detected: Expected {target_doc_type}, Got {detected_type}")
+            return {
+                "success": False,
+                "error": f"Document mismatch detected!", 
+                "data": {},
+                "doc_type": detected_type,
+                "is_back": is_back
+            }
+
+        # 4. Extract data (Only runs if no mismatch)
+        regex_data = extract_regex_data(raw_text, detected_type)
+        ai_data = analyze_with_ollama(raw_text, detected_type, is_back)
+
+        final_data = ai_data.copy()
+        if regex_data.get("ID Number"):
+            final_data["ID Number"] = regex_data["ID Number"]
+        if regex_data.get("VID Number"):
+            final_data["VID Number"] = regex_data["VID Number"]
+        
+        dob_match = re.search(r'\b\d{2}/\d{2}/\d{4}\b', raw_text)
+        if dob_match and (not final_data.get("DOB") or "1008" in final_data.get("DOB", "")):
+            final_data["DOB"] = dob_match.group()
+
+        # 5. Post-process
+        final_data = post_process(final_data, detected_type, is_back)
+        
+        # 6. Get YOLO Confidence (LAZY LOADED)
+        # Only run if we actually know what model to look for
+        if detected_type in MODEL_PATHS:
+            conf = get_yolo_confidence(detected_type, image_path)
+            if conf:
+                final_data["AI Confidence"] = conf
+
+        return {
+            "success": True,
+            "data": final_data,
+            "doc_type": detected_type,
+            "is_back": is_back,
+            "raw_text": raw_text
+        }
+    except Exception as e:
+        print(f"[ERROR] Processing failed: {e}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
+    finally:
+        # Force garbage collection again just to be safe
+        gc.collect()
+
+# ==========================================
+# 4. ROUTES
+# ==========================================
+
+@app.get("/", response_class=FileResponse)
+async def root():
+    """Serve the main HTML file"""
+    return FileResponse(os.path.join(BASE_DIR, 'templates', 'index.html'))
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    return FileResponse(os.path.join(BASE_DIR, 'static', 'favicon.ico')) if os.path.exists(os.path.join(BASE_DIR, 'static', 'favicon.ico')) else HTMLResponse(status_code=204)
+
+@app.post("/api/upload")
+async def upload(file: UploadFile = File(...), doc_type: str = Form(...)):
+    """Upload and process a document image"""
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file selected")
+
+    if file.content_type not in ["image/jpeg", "image/png", "image/jpg"]:
+        raise HTTPException(status_code=400, detail="Invalid file type. Use JPG or PNG only.")
+
+    if doc_type in ["null", "undefined", ""]:
+        doc_type = None
+
+    try:
+        # Save uploaded file
+        filepath = os.path.join(UPLOAD_FOLDER, file.filename)
+        with open(filepath, "wb") as f:
+            contents = await file.read()
+            if len(contents) > MAX_FILE_SIZE:
+                raise HTTPException(status_code=400, detail="File too large. Max 16MB.")
+            f.write(contents)
+
+        # Process document
+        result = await asyncio.to_thread(process_document, filepath, doc_type)
+        print("[DEBUG] Extraction result:", result) 
+
+        # If extraction returns empty data, treat as error
+        if result.get("success") and (not result.get("data") or not any(result["data"].values())):
+            result = {
+                "success": False,
+                "error": "No details could be extracted. Please try a clearer image.",
+                "doc_type": result.get("doc_type", doc_type),
+                "data": {},
+            }
+
+        # Auto-save data if successful
+        if result.get("success"):
+            actual_doc_type = result.get("doc_type", doc_type)
+            if actual_doc_type and actual_doc_type != "Unknown_Document":
+                _save_document_data(result["data"], actual_doc_type)
+
+        return result
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        # Cleanup file and memory
+        if os.path.exists(filepath):
+            os.remove(filepath)
+        gc.collect()
+
 @app.post("/api/save")
 async def save_data(payload: dict):
+    """Save or update extracted data manually."""
     try:
         data = payload.get("data")
         doc_type = payload.get("doc_type", "GENERAL")
@@ -400,5 +458,5 @@ async def health():
     """Health check endpoint"""
     return {
         "status": "healthy",
-        "ocr_available": reader is not None
+        "mode": "lazy_loading_enabled",
     }
