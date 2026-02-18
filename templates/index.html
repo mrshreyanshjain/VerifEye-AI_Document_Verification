@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Identity Verification System</title>
+    <link rel="stylesheet" href="static/style.css">
+    <script src="static/script.js?v=2.1" defer></script>
+</head>
+<body>
+    <div class="bg-blobs">
+        <div class="blob blob-1"></div>
+        <div class="blob blob-2"></div>
+        <div class="blob blob-3"></div>
+    </div>
+    <div class="container">
+        <!-- Landing Page -->
+        <div id="landingPage" class="page active">
+            <div class="landing-header">
+                <h1>Document Scanner</h1>
+                <p>Professional AI-Powered Identity Verification</p>
+            </div>
+
+            <div class="selector-buttons">
+                <button class="doc-btn" onclick="startScanning('AADHAAR')">
+                    <span class="doc-btn-icon">🎫</span>
+                    <span class="doc-btn-text">Aadhaar</span>
+                </button>
+                <button class="doc-btn" onclick="startScanning('PAN')">
+                    <span class="doc-btn-icon">📋</span>
+                    <span class="doc-btn-text">PAN Card</span>
+                </button>
+                <button class="doc-btn" onclick="startScanning('VOTER')">
+                    <span class="doc-btn-icon">🗳️</span>
+                    <span class="doc-btn-text">Voter ID</span>
+                </button>
+                <button class="doc-btn" onclick="startScanning('DRIVING')">
+                    <span class="doc-btn-icon">🚗</span>
+                    <span class="doc-btn-text">Driving License</span>
+                </button>
+            </div>
+        </div>
+
+        <!-- Scanning Page -->
+        <div id="scanningPage" class="page">
+            <div class="scanning-wrapper">
+                <div class="scanning-header">
+                    <div class="nav-logo">
+                        <span class="logo-icon">🔐</span>
+                        <span class="logo-text">ID Validator</span>
+                    </div>
+                    <h2 id="scanTitle">Scanning</h2>
+                    <button class="btn btn-secondary" onclick="goHome()" style="max-width: 100px;">← Back</button>
+                </div>
+
+                <div class="scanning-content">
+                    <!-- Left Panel (Upload) -->
+                    <div class="scan-panel left-panel">
+                        <div class="image-upload">
+                            <label class="file-upload">
+                                <input type="file" id="fileInput" accept="image/*" onchange="handleFileUpload(event)">
+                                <div class="upload-area" id="uploadArea">
+                                    <span class="upload-icon">📤</span>
+                                    <p><b>Drag and Drop</b> files to upload</p>
+                                    <p style="color: var(--text-muted); font-size: 0.8rem;">or</p>
+                                    <div class="browse-btn">Browse</div>
+                                    <p style="color: var(--text-muted); font-size: 0.75rem; margin-top: 1rem;">Supported files: JPG, PNG</p>
+                                </div>
+                            </label>
+                        </div>
+
+                        <!-- Preview overlay when image selected -->
+                        <div id="imagePreview" style="display:none; margin-top: 1rem; border-radius: var(--radius-md); overflow: hidden; border: 1px solid var(--border); box-shadow: 0 4px 16px rgba(99,102,241,0.08); max-height: 220px;">
+                        </div>
+
+                        <div class="progress-section">
+                            <div class="progress-bar-animated attractive">
+                                <div class="progress-glow"></div>
+                                <div class="progress-fill-animated" id="progressFill">
+                                    <span class="progress-spinner" id="progressSpinner">⏳</span>
+                                </div>
+                                <span class="progress-percent" id="progressPercent">0%</span>
+                            </div>
+                            <p class="status-text" id="statusText"><span id="processingLabel">Ready to scan</span></p>
+                        </div>
+                    </div>
+
+                    <!-- Right Panel (Results) -->
+                    <div class="scan-panel right-panel">
+                        <div class="results-header">
+                            <h3 style="font-size: 1.1rem; font-weight: 700;">Extracted Details</h3>
+                            <button class="btn btn-primary add-details-btn" id="addDetailsBtn" onclick="openEditModal()" style="display: none; padding: 0.4rem 0.8rem; font-size: 0.75rem;">
+                                <span>➕ Add Details</span>
+                            </button>
+                        </div>
+
+                        <div class="results-container" style="position: relative;">
+                            <div id="mismatchWarning" class="mismatch-inline-warning" style="display: none; background: rgba(255, 251, 235, 0.9); padding: 1rem; border-radius: 8px; border: 1px solid #fef3c7; margin-bottom: 1rem; z-index: 10;">
+                                <p id="mismatchInlineMessage" style="font-size: 0.85rem; color: #92400e; width: 100%;"></p>
+                                <div id="mismatchWarningButtons" style="display: flex; gap: 0.5rem; margin-top: 0.5rem;">
+                                    <button class="btn btn-secondary" onclick="goHome()" style="padding: 0.25rem 0.5rem; font-size: 0.75rem;">Select Again</button>
+                                    <button class="btn btn-primary" onclick="continueMismatch()" style="padding: 0.25rem 0.5rem; font-size: 0.75rem;">Continue</button>
+                                </div>
+                            </div>
+                            <div class="results-table" id="resultsTable">
+                                <div class="empty-state">
+                                    <p>No data extracted yet</p>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="action-buttons">
+                            <button class="btn btn-primary" onclick="saveData()">
+                                <span>💾 Save Results</span>
+                            </button>
+                            <button class="btn btn-secondary" onclick="resetScan()">
+                                <span>🔄 Reset</span>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Edit Modal -->
+    <div id="editModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>Edit / Add Details</h2>
+                <button class="modal-close" onclick="closeEditModal()">✕</button>
+            </div>
+
+            <div class="modal-body">
+                <form id="editForm">
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="idNumber">ID Number</label>
+                            <input type="text" id="idNumber" placeholder="Enter ID Number">
+                        </div>
+                        <div class="form-group">
+                            <label for="name">Name</label>
+                            <input type="text" id="name" placeholder="Enter Full Name">
+                        </div>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="dob">Date of Birth</label>
+                            <input type="text" id="dob" placeholder="DD/MM/YYYY">
+                        </div>
+                        <div class="form-group">
+                            <label for="gender">Gender</label>
+                            <select id="gender">
+                                <option value="">Select Gender</option>
+                                <option value="Male">Male</option>
+                                <option value="Female">Female</option>
+                                <option value="Other">Other</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="vidNumber">VID Number</label>
+                            <input type="text" id="vidNumber" placeholder="Enter VID Number">
+                        </div>
+                        <div class="form-group">
+                            <label for="parentName">Parent Name</label>
+                            <input type="text" id="parentName" placeholder="Enter Father's Name">
+                        </div>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group full-width">
+                            <label for="address">Address</label>
+                            <textarea id="address" placeholder="Enter Address" rows="3"></textarea>
+                        </div>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="validity">Validity</label>
+                            <input type="text" id="validity" placeholder="Valid Till (e.g., DD/MM/YYYY)">
+                        </div>
+                    </div>
+                </form>
+            </div>
+
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closeEditModal()">Cancel</button>
+                <button class="btn btn-primary" onclick="saveEditedData()">Save</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Success Toast -->
+    <div id="successToast" class="toast toast-success">
+        <span id="toastMessage">Operation successful!</span>
+        <button onclick="hideToast()" class="toast-close">✕</button>
+    </div>
+
+    <!-- Error Toast -->
+    <div id="errorToast" class="toast toast-error">
+        <span id="errorMessage">An error occurred!</span>
+        <button onclick="hideToast()" class="toast-close">✕</button>
+    </div>
+
+    <!-- Document Mismatch Warning Modal -->
+    <div id="mismatchModal" class="modal">
+        <div class="modal-content mismatch-modal">
+            <div class="mismatch-icon">⚠️</div>
+            <h2>Document Mismatch!</h2>
+            <p id="mismatchMessage">You selected <strong id="selectedDoc">AADHAAR</strong> but uploaded <strong id="detectedDoc">PAN Card</strong></p>
+            <div class="mismatch-actions">
+                <button class="btn btn-secondary" onclick="goHome()">Select Again</button>
+                <button class="btn btn-primary" onclick="continueMismatch()">Continue Anyway</button>
+            </div>
+        </div>
+    </div>
+
+</body>
+</html>
