@@ -31,7 +31,6 @@ app.add_middleware(
 @app.middleware("http")
 async def add_cache_control(request, call_next):
     response = await call_next(request)
-    # Don't cache HTML, but cache static files with validation
     if request.url.path.endswith('.css') or request.url.path.endswith('.js'):
         response.headers["Cache-Control"] = "public, max-age=3600, must-revalidate"
     else:
@@ -50,9 +49,7 @@ Path(UPLOAD_FOLDER).mkdir(exist_ok=True)
 # Mount static files
 app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
 
-# ==========================================
 # 1. MODEL PATHS & CONFIGURATION
-# ==========================================
 MODEL_PATHS = {
     "AADHAAR": os.path.join(BASE_DIR, "trained_models", "aadhar_best", "weights", "best.pt"),
     "PAN": os.path.join(BASE_DIR, "trained_models", "pan_best", "weights", "best.pt"),
@@ -82,11 +79,7 @@ for doc_type, path in MODEL_PATHS.items():
             print(f"✅ Loaded {doc_type} model")
         except Exception as e:
             print(f"❌ Failed to load {doc_type}: {e}")
-
-# ==========================================
 # 2. EXTRACTION LOGIC
-# ==========================================
-
 def detect_document_type(text):
     t = text.upper()
     if re.search(r'\b\d{4}\s\d{4}\s\d{4}\b', text): return "AADHAAR"
@@ -129,7 +122,6 @@ def analyze_with_ollama(text, doc_type, is_back):
     elif doc_type == "PAN":
         instr = "Extract ONLY: Name, Parent Name, DOB, ID Number. Ignore 'Income Tax Department', 'Govt of India', and Signature labels."
     elif doc_type == "DRIVING":
-        # FIXED: Added Father's Name, Issue Date and specific date instructions
         instr = "Extract Name, Parent Name (Father/Husband), DOB, ID Number (License No), Address, Issue Date (DOI), Validity (Non-Transport/Transport). Distinguish clearly between DOB and Validity."
 
     prompt = f"""Extract {doc_type} data. {instr} Raw Text: "{text}"
@@ -187,7 +179,7 @@ def post_process(data, doc_type, is_back):
             else:
                 clean[k] = str(v).strip()
 
-    # --- SPECIFIC CLEANING FOR DRIVING LICENSE ---
+    # --- CLEANING FOR DRIVING LICENSE ---
     if doc_type == "DRIVING":
         # 1. Fix DOB vs Validity confusion
         # If DOB year is in the future (e.g. > 2025), it's likely the Validity date
@@ -248,7 +240,7 @@ def process_document(image_path, target_doc_type=None):
         detected_type = detect_document_type(raw_text)
         is_back = is_back_side(raw_text)
 
-        # --- FIX: CHECK MISMATCH IMMEDIATELY ---
+        # --- CHECK MISMATCH IMMEDIATELY ---
         # We check this BEFORE trying to extract data. This ensures the error
         # is returned quickly and accurately to the frontend.
         if target_doc_type and detected_type != "Unknown_Document" and detected_type != target_doc_type:
@@ -260,7 +252,6 @@ def process_document(image_path, target_doc_type=None):
                 "doc_type": detected_type,
                 "is_back": is_back
             }
-        # ---------------------------------------
 
         # 4. Extract data (Only runs if no mismatch)
         regex_data = extract_regex_data(raw_text, detected_type)
@@ -271,8 +262,6 @@ def process_document(image_path, target_doc_type=None):
             final_data["ID Number"] = regex_data["ID Number"]
         if regex_data.get("VID Number"):
             final_data["VID Number"] = regex_data["VID Number"]
-
-        # Fallback for DOB
         dob_match = re.search(r'\b\d{2}/\d{2}/\d{4}\b', raw_text)
         if dob_match and (not final_data.get("DOB") or "1008" in final_data.get("DOB", "")):
             final_data["DOB"] = dob_match.group()
@@ -294,10 +283,7 @@ def process_document(image_path, target_doc_type=None):
             "error": str(e)
         }
 
-# ==========================================
 # 3. ROUTES
-# ==========================================
-
 @app.get("/", response_class=FileResponse)
 async def root():
     """Serve the main HTML file"""
