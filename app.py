@@ -12,6 +12,7 @@ import easyocr
 from ultralytics import YOLO
 import shutil
 from pathlib import Path
+import gc
 
 # Base directory for absolute paths
 BASE_DIR = Path(__file__).resolve().parent
@@ -51,20 +52,18 @@ app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), na
 
 # 1. MODEL PATHS & CONFIGURATION
 MODEL_PATHS = {
-    "AADHAAR": os.path.join(BASE_DIR, "trained_models", "aadhar_best", "weights", "best.pt"),
-    "PAN": os.path.join(BASE_DIR, "trained_models", "pan_best", "weights", "best.pt"),
-    "VOTER": os.path.join(BASE_DIR, "trained_models", "voter_id_best", "weights", "best.pt"),
-    "DRIVING": os.path.join(BASE_DIR, "trained_models", "driving_licence_best", "weights", "best.pt")
+    "AADHAAR": "trained_models/aadhar_best/weights/best.pt",
+    "PAN": "trained_models/pan_best/weights/best.pt",
+    "VOTER": "trained_models/voter_id_best/weights/best.pt",
+    "DRIVING": "trained_models/driving_licence_best/weights/best.pt",
 }
 MODEL_NAME = "llama3"
 
-# Load EasyOCR
+# Load EasyOCR (Global instance - Keep this, it takes ~300MB but is needed)
 print("⏳ Loading EasyOCR...")
 reader = easyocr.Reader(['en'], gpu=False)
 
-# Load YOLO Models
-print("⏳ Loading YOLO Models...")
-LOADED_MODELS = {}
+# Check Ollama Availability
 try:
     import ollama
     OLLAMA_AVAILABLE = True
@@ -72,13 +71,10 @@ except ImportError:
     OLLAMA_AVAILABLE = False
     print("❌ 'ollama' library missing.")
 
-for doc_type, path in MODEL_PATHS.items():
-    if os.path.exists(path):
-        try:
-            LOADED_MODELS[doc_type] = YOLO(path)
-            print(f"✅ Loaded {doc_type} model")
-        except Exception as e:
-            print(f"❌ Failed to load {doc_type}: {e}")
+# --- OPTIMIZATION: REMOVED GLOBAL YOLO LOADING ---
+# We do NOT load YOLO models here anymore to save RAM on Render Free Tier.
+# If you need YOLO for a specific task, load it inside the function and delete it after.
+
 # 2. EXTRACTION LOGIC
 def detect_document_type(text):
     t = text.upper()
@@ -133,6 +129,7 @@ def analyze_with_ollama(text, doc_type, is_back):
     4. "Validity" is the expiry date (Valid Till)."""
 
     try:
+        # Note: This will likely fail on Render Free Tier unless you point to an external Ollama URL
         resp = ollama.chat(model=MODEL_NAME, messages=[{'role': 'user', 'content': prompt}])
         content = resp['message']['content']
         # JSON extraction logic
@@ -141,7 +138,8 @@ def analyze_with_ollama(text, doc_type, is_back):
         if start != -1 and end != -1:
             return json.loads(content[start:end])
         return {}
-    except:
+    except Exception as e:
+        print(f"[WARN] Ollama inference failed: {e}")
         return {}
 
 
@@ -160,7 +158,6 @@ def post_process(data, doc_type, is_back):
     elif doc_type == "VOTER":
         allowed_fields = ["Name", "Parent Name", "DOB", "ID Number", "Gender"]
     elif doc_type == "DRIVING":
-        # FIXED: Added all required fields to this list
         allowed_fields = ["Name", "Parent Name", "ID Number", "DOB", "Issue Date", "Validity", "Address"]
     else:
         allowed_fields = list(data.keys())
@@ -181,20 +178,16 @@ def post_process(data, doc_type, is_back):
 
     # --- CLEANING FOR DRIVING LICENSE ---
     if doc_type == "DRIVING":
-        # 1. Fix DOB vs Validity confusion
-        # If DOB year is in the future (e.g. > 2025), it's likely the Validity date
         if "DOB" in clean:
             dob_year_match = re.search(r'\d{4}', clean["DOB"])
             if dob_year_match:
                 year = int(dob_year_match.group())
-                current_year = 2025  # You can use datetime.now().year
+                current_year = 2025 
                 if year > current_year:
-                    # Swap or move to Validity if Validity is empty
                     if "Validity" not in clean:
                         clean["Validity"] = clean["DOB"]
                     del clean["DOB"]
 
-        # 2. Clean ID Number (remove "DL No" prefix)
         if "ID Number" in clean:
             clean["ID Number"] = re.sub(r'(?i)(DL\s*No|Licence\s*No)[:\.\s-]*', '', clean["ID Number"]).strip()
 
@@ -241,19 +234,17 @@ def process_document(image_path, target_doc_type=None):
         is_back = is_back_side(raw_text)
 
         # --- CHECK MISMATCH IMMEDIATELY ---
-        # We check this BEFORE trying to extract data. This ensures the error
-        # is returned quickly and accurately to the frontend.
         if target_doc_type and detected_type != "Unknown_Document" and detected_type != target_doc_type:
             print(f"[DEBUG] Mismatch Detected: Expected {target_doc_type}, Got {detected_type}")
             return {
                 "success": False,
-                "error": f"Document mismatch detected!", # Key phrase for frontend
+                "error": f"Document mismatch detected!", 
                 "data": {},
                 "doc_type": detected_type,
                 "is_back": is_back
             }
 
-        # 4. Extract data (Only runs if no mismatch)
+        # 4. Extract data
         regex_data = extract_regex_data(raw_text, detected_type)
         ai_data = analyze_with_ollama(raw_text, detected_type, is_back)
 
@@ -268,6 +259,11 @@ def process_document(image_path, target_doc_type=None):
 
         # 5. Post-process
         final_data = post_process(final_data, detected_type, is_back)
+
+        # 6. FORCE MEMORY CLEANUP
+        del img_cv
+        del result
+        gc.collect()
 
         return {
             "success": True,
@@ -286,7 +282,6 @@ def process_document(image_path, target_doc_type=None):
 # 3. ROUTES
 @app.get("/", response_class=FileResponse)
 async def root():
-    """Serve the main HTML file"""
     return FileResponse(os.path.join(BASE_DIR, 'templates', 'index.html'))
 
 @app.get("/favicon.ico", include_in_schema=False)
@@ -295,16 +290,6 @@ async def favicon():
 
 @app.post("/api/upload")
 async def upload(file: UploadFile = File(...), doc_type: str = Form(...)):
-    """
-    Upload and process a document image
-
-    Args:
-        file: Image file (JPG, PNG)
-        doc_type: Document type (AADHAAR, PAN, VOTER, DRIVING)
-
-    Returns:
-        JSON with extracted data
-    """
     # Validate file
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file selected")
@@ -312,13 +297,12 @@ async def upload(file: UploadFile = File(...), doc_type: str = Form(...)):
     if file.content_type not in ["image/jpeg", "image/png", "image/jpg"]:
         raise HTTPException(status_code=400, detail="Invalid file type. Use JPG or PNG only.")
 
-    # Clean doc_type string (handle "null" or "undefined" from JS)
     if doc_type in ["null", "undefined", ""]:
         doc_type = None
 
+    filepath = os.path.join(UPLOAD_FOLDER, file.filename)
     try:
         # Save uploaded file
-        filepath = os.path.join(UPLOAD_FOLDER, file.filename)
         with open(filepath, "wb") as f:
             contents = await file.read()
             if len(contents) > MAX_FILE_SIZE:
@@ -327,33 +311,32 @@ async def upload(file: UploadFile = File(...), doc_type: str = Form(...)):
 
         # Process document
         result = await asyncio.to_thread(process_document, filepath, doc_type)
-        print("[DEBUG] Extraction result:", result)  # <-- LOGGING
+        print("[DEBUG] Extraction result:", result)
 
-        # If extraction returns empty data, treat as error
+        # Handle extraction failure
         if result.get("success") and (not result.get("data") or not any(result["data"].values())):
             result = {
                 "success": False,
-                "error": "No details could be extracted from this image. Please try a clearer image or another document.",
+                "error": "No details could be extracted from this image. Please try a clearer image.",
                 "doc_type": result.get("doc_type", doc_type),
                 "data": {},
             }
 
-        # Auto-save data if extraction was successful (ONLY if no mismatch)
+        # Auto-save data
         if result.get("success"):
             actual_doc_type = result.get("doc_type", doc_type)
             if actual_doc_type and actual_doc_type != "Unknown_Document":
                 _save_document_data(result["data"], actual_doc_type)
 
-        # Clean up
-        if os.path.exists(filepath):
-            os.remove(filepath)
-
         return result
 
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        # ALWAYS Clean up uploaded file to save disk space
         if os.path.exists(filepath):
             os.remove(filepath)
-        raise HTTPException(status_code=500, detail=str(e))
+        gc.collect()
 
 def _save_document_data(data, doc_type):
     """Helper to save or update document data in JSON files"""
@@ -373,22 +356,19 @@ def _save_document_data(data, doc_type):
         except:
             existing_records = []
     
-    # Check if we should update an existing record by ID Number
     id_number = data.get("ID Number")
     updated = False
     
     if id_number:
         for i, record in enumerate(existing_records):
             if record.get("ID Number") == id_number:
-                # Merge data into existing record instead of replacing
                 record.update(data)
                 updated = True
                 break
     else:
-        # If no ID Number, check if an identical record already exists
         for record in existing_records:
             if record == data:
-                updated = True # Treat as "already exists" so we don't append
+                updated = True
                 break
     
     if not updated:
@@ -401,9 +381,6 @@ def _save_document_data(data, doc_type):
 
 @app.post("/api/save")
 async def save_data(payload: dict):
-    """
-    Save or update extracted data in document-specific JSON files.
-    """
     try:
         data = payload.get("data")
         doc_type = payload.get("doc_type", "GENERAL")
@@ -423,6 +400,5 @@ async def health():
     """Health check endpoint"""
     return {
         "status": "healthy",
-        "models_loaded": len(LOADED_MODELS),
         "ocr_available": reader is not None
     }
