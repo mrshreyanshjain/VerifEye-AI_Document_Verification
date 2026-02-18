@@ -12,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from ultralytics import YOLO
 import easyocr
+from PIL import Image  # Required for resizing
 
 # ==========================================
 # 1. CONFIGURATION & SETUP
@@ -20,12 +21,12 @@ import easyocr
 # Base directory for absolute paths
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
-MAX_FILE_SIZE = 16 * 1024 * 1024  # 16MB
+MAX_FILE_SIZE = 10 * 1024 * 1024  # Reduced to 10MB to save RAM
 
 # Create uploads folder if it doesn't exist
 Path(UPLOAD_FOLDER).mkdir(exist_ok=True)
 
-app = FastAPI(title="VerifEye: AI Identity Verification System", version="2.0")
+app = FastAPI(title="VerifEye: AI Identity Verification System", version="3.0")
 
 # CORS Configuration
 app.add_middleware(
@@ -71,10 +72,26 @@ except ImportError:
     OLLAMA_AVAILABLE = False
     print("⚠️ 'ollama' library missing. AI extraction disabled.")
 
+def optimize_image(image_path):
+    """
+    CRITICAL FIX: Resizes image to max 1024px.
+    This drastically reduces RAM usage and prevents crashes.
+    """
+    try:
+        with Image.open(image_path) as img:
+            # Convert to RGB to handle PNGs/Alpha channels
+            if img.mode in ("RGBA", "P"):
+                img = img.convert("RGB")
+            
+            # Resize if too big (max 1024px width or height)
+            img.thumbnail((1024, 1024)) 
+            img.save(image_path, optimize=True, quality=85)
+    except Exception as e:
+        print(f"⚠️ Image Optimization Warning: {e}")
+
 def run_lazy_ocr(image_path):
     """
     Loads EasyOCR, extracts text, then immediately removes it from RAM.
-    This prevents OOM errors on Render Free Tier.
     """
     reader = None
     try:
@@ -83,10 +100,12 @@ def run_lazy_ocr(image_path):
         
         # Read Image
         img_cv = cv2.imread(image_path)
-        img_cv = cv2.fastNlMeansDenoisingColored(img_cv, None, 10, 10, 7, 21)
+        
+        # OPTIMIZATION: Use Grayscale instead of Denoising (Saves RAM/CPU)
+        gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
         
         # Extract
-        result = reader.readtext(img_cv, detail=0)
+        result = reader.readtext(gray, detail=0)
         return " ".join(result)
     except Exception as e:
         print(f"❌ OCR Error: {e}")
@@ -307,7 +326,11 @@ def _save_document_data(data, doc_type):
 
 def process_document(image_path, target_doc_type=None):
     try:
-        # 1. OCR (LAZY LOADED)
+        # 1. OPTIMIZE IMAGE (Resize to <1024px)
+        optimize_image(image_path)
+        gc.collect()
+
+        # 2. OCR (LAZY LOADED)
         # This function loads EasyOCR, runs it, and deletes it immediately
         raw_text = run_lazy_ocr(image_path)
         
@@ -317,11 +340,11 @@ def process_document(image_path, target_doc_type=None):
                 "error": "Could not extract text. Image might be too blurry."
             }
 
-        # 2. Detect document type
+        # 3. Detect document type
         detected_type = detect_document_type(raw_text)
         is_back = is_back_side(raw_text)
 
-        # 3. Check Mismatch
+        # 4. Check Mismatch
         if target_doc_type and detected_type != "Unknown_Document" and detected_type != target_doc_type:
             print(f"[DEBUG] Mismatch Detected: Expected {target_doc_type}, Got {detected_type}")
             return {
@@ -332,7 +355,7 @@ def process_document(image_path, target_doc_type=None):
                 "is_back": is_back
             }
 
-        # 4. Extract data (Only runs if no mismatch)
+        # 5. Extract data (Only runs if no mismatch)
         regex_data = extract_regex_data(raw_text, detected_type)
         ai_data = analyze_with_ollama(raw_text, detected_type, is_back)
 
@@ -346,10 +369,10 @@ def process_document(image_path, target_doc_type=None):
         if dob_match and (not final_data.get("DOB") or "1008" in final_data.get("DOB", "")):
             final_data["DOB"] = dob_match.group()
 
-        # 5. Post-process
+        # 6. Post-process
         final_data = post_process(final_data, detected_type, is_back)
         
-        # 6. Get YOLO Confidence (LAZY LOADED)
+        # 7. Get YOLO Confidence (LAZY LOADED)
         # Only run if we actually know what model to look for
         if detected_type in MODEL_PATHS:
             conf = get_yolo_confidence(detected_type, image_path)
@@ -404,7 +427,7 @@ async def upload(file: UploadFile = File(...), doc_type: str = Form(...)):
         with open(filepath, "wb") as f:
             contents = await file.read()
             if len(contents) > MAX_FILE_SIZE:
-                raise HTTPException(status_code=400, detail="File too large. Max 16MB.")
+                raise HTTPException(status_code=400, detail="File too large. Max 10MB.")
             f.write(contents)
 
         # Process document
@@ -458,5 +481,5 @@ async def health():
     """Health check endpoint"""
     return {
         "status": "healthy",
-        "mode": "lazy_loading_enabled",
+        "mode": "optimized_for_render_free_tier",
     }
