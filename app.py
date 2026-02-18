@@ -16,7 +16,7 @@ from pathlib import Path
 # Base directory for absolute paths
 BASE_DIR = Path(__file__).resolve().parent
 
-app = FastAPI(title="AI Identity Verification System", version="2.0")
+app = FastAPI(title="VerifEye: AI Identity Verification System", version="2.0")
 
 # CORS Configuration
 app.add_middleware(
